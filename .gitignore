@@ -1,0 +1,70 @@
+.env
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+wheelhouse/
+
+# Test, coverage and profiling
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# macOS
+.DS_Store
+
+# Docker
+*.tar
+
+# Secrets / keys / service account
+service-account.json
+*.pem
+*.key
+*.crt
+.env.*
+
+# Local wheels / offline caches
+package_wheels/
+
+# Database files
+*.db
+*.sqlite3
+
+# Node / frontend
+node_modules/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+
+# Other
+.cache/
+.local/
+dist/
