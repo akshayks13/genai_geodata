@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from google import genai
 from google.cloud import bigquery
 from vertexai.preview.language_models import TextEmbeddingModel
@@ -62,6 +63,11 @@ embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
 
 app = Flask(__name__)
+
+# Configure CORS. Allow origins from CORS_ORIGINS env (comma separated) or default to '*'.
+_cors_origins = os.getenv("CORS_ORIGINS", "*")
+origins_list = [o.strip() for o in _cors_origins.split(",") if o.strip()] or ["*"]
+CORS(app, resources={r"/*": {"origins": origins_list}}, supports_credentials=False)
 
 
 @app.get("/health")

@@ -42,3 +42,4 @@ Flask==3.0.3
 google-genai==1.38.0
 gunicorn==22.0.0
 python-dotenv==1.0.1
+Flask-Cors==4.0.1
