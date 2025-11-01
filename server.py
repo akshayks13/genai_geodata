@@ -5,7 +5,10 @@ from google.cloud import bigquery
 from vertexai.preview.language_models import TextEmbeddingModel
 import requests
 import os
+import json
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+import google.auth.transport.requests as google_auth_requests
 
 
 # --- Config ---
@@ -14,6 +17,17 @@ load_dotenv()  # load variables from .env if present
 GENAI_API_KEY = os.getenv("GENAI_API_KEY")  # for google.genai (Gemma)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # for Gemini REST
 BQ_PROJECT_ID = os.getenv("BQ_PROJECT_ID", "")  # BigQuery project id
+
+# Discovery Engine defaults (can be overridden per-request)
+DISCOVERY_PROJECT_ID = os.getenv("DISCOVERY_PROJECT_ID", "")
+DISCOVERY_ENGINE_ID = os.getenv("DISCOVERY_ENGINE_ID", "")
+DISCOVERY_LOCATION = os.getenv("DISCOVERY_LOCATION", "global")
+DISCOVERY_COLLECTION = os.getenv("DISCOVERY_COLLECTION", "default_collection")
+DISCOVERY_SERVING_CONFIG = os.getenv("DISCOVERY_SERVING_CONFIG", "default_search")
+DISCOVERY_SA_PATH = os.getenv(
+    "DISCOVERY_SA_PATH",
+    os.path.join(os.path.dirname(__file__), "vertexmanager-key.json"),
+)
 
 # --- Helpers ---
 def getGemmaResponse(prompt):
@@ -73,6 +87,95 @@ CORS(app, resources={r"/*": {"origins": origins_list}}, supports_credentials=Fal
 @app.get("/health")
 def health():
     return {"status": "ok"}, 200
+
+
+@app.post("/discovery/search")
+def discovery_search():
+    """Proxy route to Google Discovery Engine Search API.
+
+    Body JSON fields:
+    - query: string (required)
+    - Optional overrides: project_id, engine_id, discovery_location, collection, serving_config
+    - Any other fields will be forwarded to the Discovery Engine search payload.
+    Auth:
+    - Uses GOOGLE_APPLICATION_CREDENTIALS service account if set; otherwise attempts ADC.
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify(error="Invalid JSON body"), 400
+
+    # Required query
+    if not data.get("query"):
+        return jsonify(error="'query' is required in body"), 400
+
+    # Obtain access token using the Discovery SA file; also capture project_id from that file
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    try:
+        if not os.path.exists(DISCOVERY_SA_PATH):
+            return jsonify(error="Discovery service account file not found",
+                           detail=f"Expected at {DISCOVERY_SA_PATH}. Set DISCOVERY_SA_PATH env or place vertexmanager-key.json next to server.py."), 500
+        with open(DISCOVERY_SA_PATH, "r", encoding="utf-8") as f:
+            sa_info = json.load(f)
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
+        auth_req = google_auth_requests.Request()
+        creds.refresh(auth_req)
+        token = creds.token
+        sa_project = sa_info.get("project_id")
+    except Exception as e:
+        return jsonify(error="Failed to load Discovery service account or obtain token", detail=str(e)), 500
+
+    project_id = data.get("project_id") or DISCOVERY_PROJECT_ID or sa_project
+    engine_id = data.get("engine_id") or DISCOVERY_ENGINE_ID
+    location = data.get("discovery_location") or DISCOVERY_LOCATION
+    collection = data.get("collection") or DISCOVERY_COLLECTION
+    serving_config = data.get("serving_config") or DISCOVERY_SERVING_CONFIG
+
+    missing = []
+    if not project_id:
+        missing.append("project_id")
+    if not engine_id:
+        missing.append("engine_id")
+    if missing:
+        hint = "Set env (e.g., DISCOVERY_ENGINE_ID) or pass in request body." if "engine_id" in missing else "Provide required identifier(s)."
+        return jsonify(
+            error=f"Missing required field(s): {', '.join(missing)}",
+            hint=hint,
+            resolved={
+                "project_id": project_id,
+                "engine_id": engine_id,
+                "location": location,
+                "collection": collection,
+                "serving_config": serving_config,
+                "sa_path": DISCOVERY_SA_PATH,
+            },
+        ), 400
+
+    url = (
+        f"https://discoveryengine.googleapis.com/v1alpha/projects/{project_id}/"
+        f"locations/{location}/collections/{collection}/engines/{engine_id}/"
+        f"servingConfigs/{serving_config}:search"
+    )
+
+    # Build payload by forwarding all fields except our routing overrides
+    exclude_keys = {"project_id", "engine_id", "discovery_location", "collection", "serving_config"}
+    payload = {k: v for k, v in data.items() if k not in exclude_keys}
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    except requests.RequestException as re:
+        return jsonify(error="Network error calling Discovery Engine", detail=str(re)), 502
+
+    # Relay response
+    try:
+        body = resp.json()
+    except ValueError:
+        body = resp.text
+    return jsonify(status=resp.status_code, url=url, request=payload, response=body), resp.status_code
 
 
 @app.post("/query")
