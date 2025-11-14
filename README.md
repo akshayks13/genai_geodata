@@ -4,18 +4,91 @@ This repo contains a Flask service (`server.py`) that queries BigQuery, enriches
 
 Note: `server.py` currently contains hard-coded API keys and a BigQuery project ID (as per your original script). For production, you should replace these with environment variables and/or Google Application Default Credentials (ADC).
 
-## Local run
+## Local run (localhost only)
 
-1) Create and activate a virtual environment (macOS/Linux):
+### 1. Create and activate a virtual environment (macOS/Linux)
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python server.py
 ```
 
-App will serve on `http://0.0.0.0:8080` by default.
+### 2. Set required environment variables
+
+Minimal variables (replace the placeholder values):
+
+```bash
+export GENAI_API_KEY="<gemma-or-google-genai-key>"        # Used by Gemma enrichment
+export GEMINI_API_KEY="<gemini-api-key>"                  # Used for final answer & RAG
+export BQ_PROJECT_ID="<bigquery-project-id>"              # Project that owns embedding table
+export DISCOVERY_ENGINE_ID="<discovery-engine-id>"        # For /discovery/search route
+export VERTEX_INDEX_ENDPOINT="<vertex-index-endpoint>"    # e.g. projects/123/locations/us-central1/indexEndpoints/456
+export VERTEX_DEPLOYED_INDEX_ID="<deployed-index-id>"     # e.g. 7890123456789012345
+# Optional / tuning
+export CORS_ORIGINS="http://localhost:3000"               # Comma-separated list; defaults allow local dev
+export VERTEX_API_ENDPOINT="us-central1-aiplatform.googleapis.com"  # Override if needed
+```
+
+Data/key files (if you use them) expected by the hybrid search:
+
+* `gemini_cleaned_text.json` – local corpus for TF-IDF (place in repo root or same dir as `server.py`).
+* `vertexmanager-key.json` – service account key (optional; prefer ADC). If omitted, Application Default Credentials are used.
+
+### 3. Run the server
+
+```bash
+python3 server.py
+```
+
+The app listens on `http://0.0.0.0:8080`.
+
+### 4. Available endpoints (all POST except /health)
+
+| Endpoint | Purpose | Sample Payload |
+|----------|---------|----------------|
+| `GET /health` | Liveness check | n/a |
+| `POST /query` | BigQuery + enrichment + Gemini answer | `{ "question": "What are the cybersecurity risks for AI adoption in Indian cities?" }` |
+| `POST /discovery/search` | Discovery Engine search passthrough | `{ "query": "renewable energy" }` |
+| `POST /hybrid_search` | Dense + sparse (TF-IDF) + Vertex neighbors + RAG | `{ "question": "Impact of AI on transport safety", "neighbor_count": 8, "alpha": 0.5 }` |
+
+Field notes:
+* `neighbor_count` (int) – how many neighbors to request from Vertex (defaults inside code if omitted).
+* `alpha` (float 0–1) – balancing parameter for sparse vs dense retrieval (RRF style); optional.
+
+### 5. Sample curl commands (localhost)
+
+Health:
+```bash
+curl -s http://localhost:8080/health | jq
+```
+
+Query:
+```bash
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "What are the cybersecurity risks for AI adoption in Indian cities?"}' | jq
+```
+
+Discovery search:
+```bash
+curl -s -X POST http://localhost:8080/discovery/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "renewable energy"}' | jq
+```
+
+Hybrid search (dense + sparse + RAG):
+```bash
+curl -s -X POST http://localhost:8080/hybrid_search \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "Impact of AI on transport safety", "neighbor_count": 8, "alpha": 0.55}' | jq
+```
+
+If you do not have `jq` installed, you can omit the final pipe or install it:
+
+```bash
+brew install jq
+```
 
 ## Docker build & run
 
@@ -27,46 +100,6 @@ docker build -t gemma-server:latest .
 docker run --rm -p 8080:8080 \
   gemma-server:latest
 ```
-
-Then call the service:
-
-```bash
-curl -s -X POST http://localhost:8080/query \
-  -H 'Content-Type: application/json' \
-  -d '{"question": "What are the cybersecurity risks for AI adoption in Indian cities?"}' | jq
-```
-
-## Deploy to Cloud Run
-
-Requirements:
-- `gcloud` CLI authenticated to your project
-- A Google Cloud project with billing enabled
-- BigQuery dataset/table accessible to the runtime service account
-
-Set env variables (replace placeholders):
-
-```bash
-export PROJECT_ID="your-gcp-project-id"
-export REGION="us-central1"
-```
-
-Build the image with Cloud Build and push:
-
-```bash
-gcloud builds submit --tag gcr.io/$PROJECT_ID/gemma-server
-```
-
-Deploy to Cloud Run:
-
-```bash
-gcloud run deploy gemma-server \
-  --image gcr.io/$PROJECT_ID/gemma-server \
-  --platform managed \
-  --region $REGION \
-  --allow-unauthenticated
-```
-
-After deploy, Cloud Run will print a service URL. You can test it with curl as above.
 
 ## Credentials & IAM
 

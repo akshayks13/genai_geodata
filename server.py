@@ -9,6 +9,8 @@ import json
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 import google.auth.transport.requests as google_auth_requests
+from sklearn.feature_extraction.text import TfidfVectorizer  # new for hybrid search
+from google.cloud import aiplatform_v1  # vertex vector search
 
 
 # --- Config ---
@@ -24,9 +26,29 @@ DISCOVERY_ENGINE_ID = os.getenv("DISCOVERY_ENGINE_ID", "")
 DISCOVERY_LOCATION = os.getenv("DISCOVERY_LOCATION", "global")
 DISCOVERY_COLLECTION = os.getenv("DISCOVERY_COLLECTION", "default_collection")
 DISCOVERY_SERVING_CONFIG = os.getenv("DISCOVERY_SERVING_CONFIG", "default_search")
-DISCOVERY_SA_PATH = os.getenv(
-    "DISCOVERY_SA_PATH",
-    os.path.join(os.path.dirname(__file__), "vertexmanager-key.json"),
+def _resolve_existing_path(basename: str, override: str | None = None):
+    """Return the first existing path among sensible locations.
+    Order: explicit override -> alongside this file -> CWD -> parent of this file.
+    """
+    candidates = []
+    if override:
+        candidates.append(override)
+    base_dir = os.path.dirname(__file__)
+    candidates.extend([
+        os.path.join(base_dir, basename),
+        os.path.join(os.getcwd(), basename),
+        os.path.join(os.path.dirname(base_dir), basename),
+    ])
+    for p in candidates:
+        try:
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return candidates[0] if candidates else None
+
+DISCOVERY_SA_PATH = _resolve_existing_path(
+    "vertexmanager-key.json", os.getenv("DISCOVERY_SA_PATH")
 )
 
 # --- Helpers ---
@@ -75,6 +97,81 @@ else:
     bq_client = bigquery.Client(project=BQ_PROJECT_ID)
 embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
+# --- Hybrid Search Globals ---
+VERTEX_API_ENDPOINT = os.getenv("VERTEX_API_ENDPOINT", "")  # optional override
+VERTEX_INDEX_ENDPOINT = os.getenv("VERTEX_INDEX_ENDPOINT", "")  # projects/..../indexEndpoints/ID
+VERTEX_DEPLOYED_INDEX_ID = os.getenv("VERTEX_DEPLOYED_INDEX_ID", "")  # deployed index id
+SERVICE_ACCOUNT_KEY_PATH = _resolve_existing_path(
+    "vertexmanager-key.json", os.getenv("VERTEX_SA_PATH")
+)
+
+vectorizer = TfidfVectorizer(max_features=5000, stop_words="english")
+_tfidf_fitted = False
+_corpus_loaded = False
+_corpus_texts = []
+
+def _load_corpus():
+    """Load local corpus for TF-IDF fitting. Expects gemini_cleaned_text.json mapping id->text."""
+    global _corpus_loaded, _corpus_texts
+    if _corpus_loaded:
+        return
+    corpus_path = _resolve_existing_path("gemini_cleaned_text.json")
+    if not corpus_path or not os.path.exists(corpus_path):
+        return  # handled later if needed
+    try:
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _corpus_texts = list(data.values())
+        _corpus_loaded = True
+    except Exception:
+        # Leave as not loaded; error surfaced on use
+        pass
+
+def _fit_tfidf_if_needed():
+    global _tfidf_fitted
+    if _tfidf_fitted:
+        return
+    _load_corpus()
+    if not _corpus_texts:
+        raise RuntimeError("Corpus file gemini_cleaned_text.json not found or unreadable in expected locations (cwd, app dir, parent). Set absolute path if needed.")
+    vectorizer.fit(_corpus_texts)
+    _tfidf_fitted = True
+
+def _sparse_embedding(text: str):
+    if not _tfidf_fitted:
+        raise RuntimeError("TF-IDF not fitted yet.")
+    tfidf_vector = vectorizer.transform([text])
+    values = [float(v) for v in tfidf_vector.data]
+    dims = [int(i) for i in tfidf_vector.indices]
+    return {"values": values, "dimensions": dims}
+
+def _dense_query_embedding(text: str):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Missing GEMINI_API_KEY for embedding model.")
+    client_local = genai.Client(api_key=GEMINI_API_KEY)
+    response = client_local.models.embed_content(
+        model="models/embedding-001",
+        contents=[text],
+        config={"task_type": "RETRIEVAL_QUERY", "output_dimensionality": 768},
+    )
+    if hasattr(response, "embeddings"):
+        return response.embeddings[0].values
+    return response.embedding.values
+
+def _vertex_match_client():
+    # Try service account key else ADC
+    if SERVICE_ACCOUNT_KEY_PATH and os.path.exists(SERVICE_ACCOUNT_KEY_PATH):
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_KEY_PATH,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+    else:
+        creds = None  # let library pick ADC
+    client_options = {}
+    if VERTEX_API_ENDPOINT:
+        client_options["api_endpoint"] = VERTEX_API_ENDPOINT
+    return aiplatform_v1.MatchServiceClient(client_options=client_options, credentials=creds)
+
 
 app = Flask(__name__)
 
@@ -111,9 +208,9 @@ def discovery_search():
     # Obtain access token using the Discovery SA file; also capture project_id from that file
     scopes = ["https://www.googleapis.com/auth/cloud-platform"]
     try:
-        if not os.path.exists(DISCOVERY_SA_PATH):
+        if not DISCOVERY_SA_PATH or not os.path.exists(DISCOVERY_SA_PATH):
             return jsonify(error="Discovery service account file not found",
-                           detail=f"Expected at {DISCOVERY_SA_PATH}. Set DISCOVERY_SA_PATH env or place vertexmanager-key.json next to server.py."), 500
+                           detail=f"Tried at {DISCOVERY_SA_PATH}. Set DISCOVERY_SA_PATH env or place vertexmanager-key.json in project root or alongside server.py."), 500
         with open(DISCOVERY_SA_PATH, "r", encoding="utf-8") as f:
             sa_info = json.load(f)
         creds = service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
@@ -314,6 +411,114 @@ Instead, fill those gaps with your own knowledge
         )
     except Exception as e:
         return jsonify(error="Internal error", detail=str(e)), 500
+
+
+@app.post("/hybrid_search")
+def hybrid_search():
+    """Hybrid dense + sparse vector search with Vertex AI Index + RAG answer.
+
+    Body JSON:
+      question: str (required)
+      neighbor_count: int (optional, default 10)
+      alpha: float (0..1, dense weight for RRF, default 0.8)
+    Environment required:
+      VERTEX_INDEX_ENDPOINT, VERTEX_DEPLOYED_INDEX_ID (and optionally VERTEX_API_ENDPOINT)
+      gemini_cleaned_text.json file for TF-IDF corpus.
+    """
+    body = request.get_json(silent=True) or {}
+    question = body.get("question")
+    if not question:
+        return jsonify(error="'question' is required."), 400
+    neighbor_count = int(body.get("neighbor_count", 10))
+    alpha = float(body.get("alpha", 0.8))
+    try:
+        _fit_tfidf_if_needed()
+    except Exception as e:
+        return jsonify(error="TF-IDF setup failed", detail=str(e)), 500
+    if not VERTEX_INDEX_ENDPOINT or not VERTEX_DEPLOYED_INDEX_ID:
+        return jsonify(error="Missing Vertex index config", detail="Set VERTEX_INDEX_ENDPOINT and VERTEX_DEPLOYED_INDEX_ID env vars."), 500
+    try:
+        dense_vec = _dense_query_embedding(question)
+    except Exception as e:
+        return jsonify(error="Dense embedding failed", detail=str(e)), 500
+    try:
+        sparse = _sparse_embedding(question)
+    except Exception as e:
+        return jsonify(error="Sparse embedding failed", detail=str(e)), 500
+    # Build request
+    try:
+        datapoint = aiplatform_v1.IndexDatapoint(
+            feature_vector=dense_vec,
+            sparse_embedding=aiplatform_v1.IndexDatapoint.SparseEmbedding(
+                values=sparse["values"], dimensions=sparse["dimensions"]
+            ),
+        )
+        query_obj = aiplatform_v1.FindNeighborsRequest.Query(
+            datapoint=datapoint,
+            neighbor_count=neighbor_count,
+            rrf=aiplatform_v1.FindNeighborsRequest.Query.RRF(alpha=alpha),
+        )
+        request_v = aiplatform_v1.FindNeighborsRequest(
+            index_endpoint=VERTEX_INDEX_ENDPOINT,
+            deployed_index_id=VERTEX_DEPLOYED_INDEX_ID,
+            queries=[query_obj],
+            return_full_datapoint=False,
+        )
+        match_client = _vertex_match_client()
+        response_v = match_client.find_neighbors(request_v)
+    except Exception as e:
+        return jsonify(error="Vertex find_neighbors failed", detail=str(e)), 500
+    # Load corpus mapping id->text
+    corpus_path = _resolve_existing_path("gemini_cleaned_text.json")
+    try:
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            corpus_data = json.load(f)
+    except Exception as e:
+        return jsonify(error="Failed to load corpus for RAG", detail=f"{e}. Expected gemini_cleaned_text.json near app or project root."), 500
+    neighbors_out = []
+    collected_texts = []
+    for nset in response_v.nearest_neighbors:
+        for n in nset.neighbors:
+            dp_id = n.datapoint.datapoint_id
+            distance = getattr(n, "distance", None)
+            raw_text = corpus_data.get(dp_id, "")
+            snippet = raw_text[:400].strip() if raw_text else ""
+            neighbors_out.append({"id": dp_id, "distance": distance, "snippet": snippet})
+            if raw_text:
+                collected_texts.append(snippet)
+    # RAG answer
+    rag_answer = None
+    normal_answer = None
+    try:
+        raw_info = "\n".join(collected_texts)
+        rag_prompt = (
+            f"Provided Question: {question}\n\n"
+            f"Embed the provided context snippets into a credible analytical answer.\n\n"
+            f"Raw Info:\n{raw_info}"
+        )
+        rag_answer = genai.Client(api_key=GEMINI_API_KEY).models.generate_content(
+            model="gemini-2.0-flash",
+            contents=rag_prompt,
+        ).text.strip()
+    except Exception as e:
+        rag_answer = f"RAG generation failed: {e}"  # surface error inline
+    try:
+        normal_answer = genai.Client(api_key=GEMINI_API_KEY).models.generate_content(
+            model="gemini-2.0-flash",
+            contents=(
+                f"Provided Question: {question}\n\nGive a professional research-quality answer."
+            ),
+        ).text.strip()
+    except Exception as e:
+        normal_answer = f"Normal generation failed: {e}"
+    return jsonify(
+        question=question,
+        neighbor_count=neighbor_count,
+        alpha=alpha,
+        neighbors=neighbors_out,
+        rag_answer=rag_answer,
+        normal_answer=normal_answer,
+    )
 
 
 if __name__ == "__main__":

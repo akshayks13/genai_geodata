@@ -68,3 +68,5 @@ node_modules/
 .cache/
 .local/
 dist/
+gemini_api_key
+vertexmanager-key.json
